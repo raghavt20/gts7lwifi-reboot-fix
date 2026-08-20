@@ -409,3 +409,70 @@ conclusive result — the fix is verified working.**
 - Full logcat dump analyzed: session scratchpad
   `/private/tmp/claude-501/-Users-raghavt20/.../scratchpad/logcat_full.txt`
   (33 matching abort signatures via `grep -c abortOnMismatch`)
+
+---
+
+# Other issues observed (unrelated to the reboot loop above)
+
+Separate device quirks noticed while working on this port. Not related to
+the `abortOnMismatch`/GPU-mem crash — kept here since they're the same
+underlying theme (donor-firmware/actual-hardware mismatches surfacing in
+different subsystems) and the same device/repo.
+
+## WiFi failed to come up after a reboot (one occurrence, self-resolved)
+
+After a reboot (unrelated one, done to fix a SystemUI lockscreen theming
+glitch), WiFi stayed disabled despite `wifi_on=1`. `dumpsys wifi` showed:
+
+- `Current wifi mode: DisabledState`, `NumActiveModeManagers: 0`.
+- The `WifiController` state-machine log showed `CMD_RECOVERY_DISABLE_WIFI`
+  firing repeatedly (record counter in the tens of thousands) — Android's
+  own WiFi self-recovery mechanism retrying and giving up, over and over,
+  rather than a one-time failure.
+- Root failure, in `SemHalDeviceManager` (Samsung's WiFi HAL layer, part
+  of the gts9p donor firmware):
+  ```
+  SemHalDeviceManager: getVendorConnFileInfo: called but mSehWifi is null
+  SemHalDeviceManager: createIface: createIfaceType=0, ...
+  SemHalDeviceManager: Combination is NOT matched
+  SemSupplicantStaIfaceHalHidlImpl: ISehSupplicantStaIface.setExtendedCommand
+    failed: {.code = FAILURE_UNKNOWN, .debugMessage = -1}
+  ```
+  `Combination is NOT matched` means the HAL queried the kernel/chip for
+  supported interface combinations (STA/AP/P2P coexistence) and didn't get
+  back something it recognized as valid, so it refused to create the WiFi
+  client interface at all — which is what fed the recovery-disable loop.
+
+**Resolution: a second manual reboot fixed it completely** — WiFi came up
+and connected normally on the next boot, no further changes made. Since a
+genuine HAL/kernel capability mismatch would be expected to fail
+identically on every boot, this looks like a **boot-time race/timing
+glitch** in WiFi HAL init (e.g. something the HAL depends on not being
+ready yet when it queried chip capabilities), not a hard incompatibility.
+Not investigated further since it self-resolved. Worth checking this
+section first if WiFi fails to come up again after a reboot — if it
+recurs repeatedly (not just once), that would point back toward a real
+capability mismatch worth digging into (similar to the GPU-mem case
+above), possibly requiring a HAL-side patch analogous to the
+`libmeminfo.so` fix.
+
+## S Pen BLE remote pairing not established
+
+`/efs/spen/blespen_addr` (the EFS-stored bonded S Pen BLE MAC address) is
+0 bytes — empty. Basic pen writing/hover (EMR digitizer, no BLE involved)
+works fine (`epen_count` shows hundreds of historical uses). What doesn't
+work is the BLE-based "S Pen remote"/Air Command features (battery %, air
+actions, remote shutter) — every pen insertion triggers a connect attempt
+with `last paired address is null`, cycles
+`CONNECTING -> DISCONNECTED/CANCELLED` every ~10-40s, and never succeeds.
+Classic Bluetooth was also off at the time (`bluetooth_on=0`, 0 bonded
+devices of any kind).
+
+Likely cause: Samsung's S Pen BLE pairing is normally provisioned at the
+factory (bundled pen <-> device serial pairing baked into EFS) — on this
+donor-firmware port, that factory pairing record for this specific
+physical pen plausibly never existed. Not yet fixed; suggested next step
+is turning on full Bluetooth and trying a manual re-pair via Settings ->
+Advanced features -> S Pen, if that flow exists in this build. Not
+something a binary patch is applicable to (it's a pairing-state/data
+issue, not a crash).
