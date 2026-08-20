@@ -82,12 +82,12 @@ match the crash PC to `nm -D`/`objdump -d` output, find the equivalent
 
 ## Verified
 
-Post-install: 10+ minutes clean on a targeted system_server crash watch
-(pre-patch, this crashed every ~2 minutes without exception), plus a
-broad `adb logcat` sweep — native crashes, Java crashes, ANRs, dropbox
-crash records, SELinux denials, RescueParty escalation, not just the
-specific signature above — clean for the entire post-boot period. Full
-verification log, updated as monitoring continues, in `FINDINGS.md`.
+Post-install: a full 20-minute targeted system_server crash watch
+completed with zero crashes (pre-patch, this crashed every ~2 minutes
+without exception), plus a broad `adb logcat` sweep — native crashes,
+Java crashes, ANRs, dropbox crash records, SELinux denials, RescueParty
+escalation, not just the specific signature above — clean for the entire
+post-boot period. Full verification log in `FINDINGS.md`.
 
 ## Repo layout
 

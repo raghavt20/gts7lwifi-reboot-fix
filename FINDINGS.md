@@ -365,14 +365,14 @@ module-removal/mount changes might have introduced:
   the GPU-mem pull cadence.
 - Zero recurrences of `abortOnMismatch`/`ReadProcessGpuUsageKb` anywhere.
 
-## Verification status as of this writeup
+## Verification status: confirmed
 
-Targeted system_server watch: **10+ minutes clean** (two 5-minute
-heartbeats passed, no crash) at time of writing, still running toward the
-full 20-minute mark in the background. Broad sweep above is clean for the
-entire post-boot period. Given the pre-patch cadence was a crash every
-~2 minutes without exception, 10+ clean minutes is already a strong
-signal; treating this as verified pending the watch's final result.
+Targeted system_server watch completed its full 20-minute run with zero
+crashes (four 5-minute heartbeats all clean, watch self-terminated at the
+1200s mark rather than being cut short). Broad sweep above stayed clean
+for the entire post-boot period. Given the pre-patch cadence was a crash
+every ~2 minutes without exception, **20 crash-free minutes is a
+conclusive result — the fix is verified working.**
 
 ## Operational notes
 - After a **real** reboot (not the framework-only crash-restarts), `adb`
