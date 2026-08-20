@@ -345,7 +345,34 @@ rebooted again.
   `Fatal signal`, `AndroidRuntime`, `abortOnMismatch`, `beginning of
   crash`, zygote/system_server death, ANRs. Previously the device crashed
   every ~2 minutes without fail, so a clean stretch is a strong signal.
-  (Result to be appended once the watch completes.)
+
+## Broad crash sweep (not just the specific signature)
+
+Separately from the targeted watch above, did a full sweep of everything
+logged since boot, to catch any *other* regression the patch or the
+module-removal/mount changes might have introduced:
+- `logcat -b crash`: empty, no native crashes for any process.
+- No `FATAL EXCEPTION` (Java crashes) anywhere in the buffer.
+- No ANRs (`ANR in`, `Input dispatching timed out`).
+- `dumpsys dropbox --print`: no crash tags recorded.
+- Zero SELinux denials (`avc: ... denied`) — the module's `chcon`/bind
+  mount didn't break any permission context.
+- No RescueParty/PackageWatchdog mitigation triggered.
+- The one thing that looked suspicious at a glance — 27 `statsd ...
+  Gauge Stats puller failed` lines — all share the exact same timestamp
+  (14:22:25.512, right at boot), a normal one-time "some pullers aren't
+  ready yet this early in boot" batch, not a recurring pattern tied to
+  the GPU-mem pull cadence.
+- Zero recurrences of `abortOnMismatch`/`ReadProcessGpuUsageKb` anywhere.
+
+## Verification status as of this writeup
+
+Targeted system_server watch: **10+ minutes clean** (two 5-minute
+heartbeats passed, no crash) at time of writing, still running toward the
+full 20-minute mark in the background. Broad sweep above is clean for the
+entire post-boot period. Given the pre-patch cadence was a crash every
+~2 minutes without exception, 10+ clean minutes is already a strong
+signal; treating this as verified pending the watch's final result.
 
 ## Operational notes
 - After a **real** reboot (not the framework-only crash-restarts), `adb`
