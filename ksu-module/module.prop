@@ -1,0 +1,6 @@
+id=gpumem_abort_fix
+name=GPU Mem Abort Fix
+version=v1
+versionCode=1
+author=raghavtandon2000
+description=Patches libmeminfo.so BpfMapRO::abortOnMismatch to no-op (single instruction: tbnz->b epilogue at 0x16f88). Prevents system_server SIGABRT crash-loop caused by missing gpu_mem_total_map BPF pin on the Paradigm kernel (kernel lacks the gpu_mem_total tracepoint, so gpuservice never creates the map, and libmeminfo aborts instead of failing gracefully when the map is absent). See ~/gts9p-reboot-fix/FINDINGS.md.
