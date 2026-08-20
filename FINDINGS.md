@@ -54,7 +54,13 @@ signal 6 (SIGABRT), Cmdline: system_server
 ... invoked from statsd's PullAtomCallback (GPU memory usage stat)
 ```
 
-Trigger cadence matches `statsd`'s periodic GPU-memory pull atom (~2 min).
+Trigger cadence matches `statsd`'s periodic GPU-memory pull atom.
+
+**Correction (see "Crash cadence" section below): the true steady-state
+period is ~60 minutes, not ~2 minutes.** The ~2 min figure originally
+recorded here was measured from a narrow window right after a reboot and
+mischaracterizes the actual pull interval — see below for the full
+timestamp analysis.
 
 ### Why: the `gpu_mem_total_map` BPF map doesn't exist on this device
 Verified with full root (`su 0 ls -laZ /sys/fs/bpf/` and all subdirs:
@@ -234,6 +240,22 @@ neighbors — patching must not break PAC-protected return address handling;
 since we're only touching a mid-function branch (not prologue/epilogue),
 should be safe, but must verify after patching.
 
+**Resolved (blast-radius check).** Searched the full binary
+(`objdump -d libmeminfo.so.orig | grep 'bl.*16f6c'`) for every caller of
+this function. There are exactly two:
+- `0x13ba8` — inside `ReadProcessGpuUsageKb` (the one that crashes,
+  statsd's periodic pull target).
+- `0x13048` — inside `ReadPerProcessGpuMem` (a per-process GPU-memory
+  breakdown; from the name/signature this looks `dumpsys`/diagnostic
+  triggered rather than periodic, not independently confirmed).
+
+Nothing else in the binary calls into this check. Both callers read the
+same map shape (`BpfMapRO<uint64_t,uint64_t>` against `gpu_mem_total_map`)
+— the patch's blast radius is scoped precisely to GPU-memory BPF reads,
+not some general-purpose shared validator. It does not touch validation
+for any unrelated BPF map (netd, tethering, uid stats, etc. all have their
+own separately-instantiated template code elsewhere in other libraries).
+
 ## Discovered: an existing community hotfix module was already active
 
 (Correction: originally wrote this up as "mismatched foreign module" —
@@ -272,6 +294,16 @@ While checking for `ksud` (KernelSU CLI) to install our module, found
   next boot, restoring the real stock `services.jar`).
 - User was asked how to handle this and chose: remove it, then install our
   fix on a clean baseline.
+
+**Update, from the port's developer**: MinsOS 1.1.0 carries this same fix
+inside the ROM itself, no module needed — `minsos_gpustats_hotfix` was
+built for 1.0.0. This device is on 1.0.0 (confirmed). So there are two
+independent ways to fix this: this repo's module (works today, needs
+maintaining across ROM updates), or updating to MinsOS 1.1.0 (native fix,
+no module to maintain, but is a full ROM update). If updating to 1.1.0,
+this module should be removed first — same reasoning as removing
+`minsos_gpustats_hotfix` was: an old module bind-mounting a file the newer
+base doesn't need is more likely to cause problems than help.
 
 ## Module installed (staged for next boot)
 
@@ -409,6 +441,53 @@ conclusive result — the fix is verified working.**
 - Full logcat dump analyzed: session scratchpad
   `/private/tmp/claude-501/-Users-raghavt20/.../scratchpad/logcat_full.txt`
   (33 matching abort signatures via `grep -c abortOnMismatch`)
+
+## Crash cadence: corrected (steady ~60 min in continuous operation, not ~2 min)
+
+The original root-cause section above said "~2 min" cadence. That was
+measured only from a narrow post-reboot window and is misleading as a
+description of the actual periodic pull interval. Redid this properly by
+pulling every `abortOnMismatch` timestamp across the full available
+logcat history (spans 08-15 through 08-20, `grep abortOnMismatch` on the
+full captured buffer, 32 unique timestamps) and computing the interval
+between each consecutive pair:
+
+```
+08-17 19:24:36 -> 20:24:52  :  3615.7s  (60.3 min)
+08-17 20:24:52 -> 21:25:30  :  3638.5s  (60.6 min)
+08-17 21:25:30 -> 22:26:09  :  3638.4s  (60.6 min)
+08-17 22:26:09 -> 23:26:25  :  3616.2s  (60.3 min)
+08-17 23:26:25 -> 00:26:41  :  3616.5s  (60.3 min)
+... (consistently 3616-3639s, i.e. 60.3-60.6 min, for every consecutive
+    pair recorded while the device stayed up without a reboot in between)
+```
+
+**When the device is running continuously without a reboot, the crash
+recurs on a remarkably steady ~60-minute period** (3616-3639s across
+every measured interval, <1% jitter). That's the true `statsd` pull
+interval for this atom on this build.
+
+The ~2-minute figure comes from a *different* phenomenon: immediately
+after any boot (real or the crash-induced framework restart), the first
+one or two pulls happen in quick succession before settling into the
+steady hourly rhythm:
+
+```
+08-17 18:19:48 -> 18:20:20  :    32.8s
+08-20 13:26:46 -> 13:27:05  :    18.9s
+08-20 13:27:05 -> 13:28:44  :    99.0s
+08-20 13:28:44 -> 13:29:12  :    28.2s
+```
+
+If a device is manually rebooted repeatedly (e.g. a user reacting to what
+looks like a crash by power-cycling again), it stays trapped in this
+post-boot burst window indefinitely and never surfaces the true hourly
+period — which is almost certainly why this originally read as "reboots
+every few minutes" rather than "crashes every hour." Both the ~2 min and
+~30-60 min descriptions are real and correct, they're just describing two
+different regimes of the same bug: the immediate post-boot retry burst vs.
+the steady-state periodic pull once a boot survives past the first minute
+or two.
 
 ---
 
