@@ -1,0 +1,6 @@
+id=sdcard_suspend_fix
+name=SD Card Deep Sleep Fix
+version=v0.0.1
+versionCode=1
+author=raghavtandon2000
+description=Fixes 0s deep sleep / always-awake caused by the microSD card's mmc_bus_suspend PM callback failing on every suspend attempt (kernel driver issue, see FINDINGS.md). Unbinds the SDHCI driver (8804000.sdhci/sdhci_msm) a few seconds after the screen turns off, letting the device suspend normally, and rebinds it immediately when the screen turns on so the SD card is available while awake. Card stays usable while the screen is on; deep sleep works once it's off.
