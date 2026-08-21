@@ -555,3 +555,89 @@ is turning on full Bluetooth and trying a manual re-pair via Settings ->
 Advanced features -> S Pen, if that flow exists in this build. Not
 something a binary patch is applicable to (it's a pairing-state/data
 issue, not a crash).
+
+## Deep sleep completely broken (0s deep sleep, always-awake) — root-caused and fixed
+
+Reported via a third-party battery-stats app (FKM) showing 0 seconds of
+deep sleep and 22h+ continuously "awake" with the screen off. Confirmed
+this wasn't an app-reporting quirk - it's real, root-caused, and testable.
+
+### Diagnosis
+
+`adb shell su 0 dumpsys batterystats --history` (23-hour window) showed
+the device attempting to suspend roughly every 60-70 seconds and getting
+aborted almost every single time:
+
+```
+wake_reason=0:"Abort: Callback failed on mmc0:59b4 in mmc_bus_suspend+0x0/0x98 returned -123"
+```
+
+Quantified across the full history: 1213 suspend attempts, 879 (72%)
+aborted specifically by this cause, most of the remainder aborted by a
+related `wake_reason=0:"-1 misconfigured IRQ 310 qcom,qmp-aop"`. **Zero
+gaps longer than 2 minutes anywhere in the 23-hour window** - the device
+had never once achieved a real suspend.
+
+Live `dmesg` confirmed the mechanism precisely:
+```
+mmc0: Card stuck in wrong state! card_busy_detect status: 0xf00
+mmc0: Send Notification about SD Card IO Error
+dpm_run_callback(): mmc_bus_suspend+0x0/0x98 returns -123
+PM: Device mmc0:59b4 failed to suspend async: error -123
+Resume caused by misconfigured IRQ 310 qcom,qmp-aop
+mmc0: card 59b4 removed
+mmc0: new ultra high speed SDR50 SDHC card at address 59b4
+```
+
+`mmc0` was confirmed via `dumpsys mount` (`mDescription=SD card`,
+`mRemovable=true`) to be the **physical microSD card slot**, not internal
+storage (a 14.9 GB SDHC UHS card was inserted). Right at the moment of
+every suspend attempt, the SD card's bus got stuck busy; its suspend
+callback failed; and the kernel's power-management core (`dpm_run_callback`)
+treated that failure as fatal and **aborted the entire system suspend**,
+not just the SD card's own suspend - followed by a full card
+remove/re-enumerate cycle to recover the card into working state, ready to
+fail the same way again ~60-70 seconds later.
+
+The exact kernel counters (`/sys/power/suspend_stats/{success,fail,
+last_failed_dev}`) corroborated the history-log analysis precisely:
+`success=20` vs `fail=1221`, `last_failed_dev=mmc0:59b4`, over the
+device's uptime up to that point.
+
+### Fix (physical, not software): remove the SD card
+
+Root cause is this kernel's SDHCI driver (ported from the gts9p donor
+firmware, controller node `8804000.sdhci`) not handling this SD card's
+bus power-down cleanly during suspend on the real hardware - same
+donor-firmware/actual-hardware mismatch theme as the other issues in this
+file, just a different subsystem (SD/MMC instead of GPU-mem BPF or WiFi
+HAL). This is a kernel PM-callback-level bug, not something fixable with
+a KernelSU module/binary patch the way the reboot-loop fix was (that
+patched a userspace library; this would need a kernel driver/DTS patch to
+the SDHCI controller node itself).
+
+**Removing the physical microSD card fixed it immediately and completely.**
+Reset `/sys/power/suspend_stats` via `dumpsys batterystats --reset` and
+polled the same kernel counters after removal:
+
+```
+baseline (card in, before removal):  success=20   fail=1221
++0s   (card out):                    success=39   fail=1222  last_failed_dev=mmc0:59b4 (stale)
++30s:                                success=67   fail=1222  last_failed_dev=mmc0:59b4 (stale)
++60s:                                success=95   fail=1223  last_failed_dev=alarmtimer
+```
+
+`last_failed_dev` shifted from `mmc0:59b4` to `alarmtimer` (an alarm
+occasionally firing right as suspend starts - normal, expected, not a
+bug) and never referenced `mmc0` again. Successful suspends went from
+20-in-23-hours to dozens-per-minute. Confirmed independently via FKM
+after leaving the device idle: deep sleep is now being recorded normally.
+
+**Tradeoff, unresolved**: this is "SD card in vs. real sleep" until the
+SDHCI driver is patched for this hardware. If you need the SD card
+mounted, deep sleep will not work; if you need deep sleep, the card has
+to stay out. No software workaround found or attempted yet - this would
+need an actual kernel driver/device-tree fix (e.g. a suspend/resume quirk
+flag for this card-controller combination, or bypassing the card
+busy-detect check that's causing `mmc_bus_suspend` to bail), which is out
+of scope for a userspace KernelSU module.
