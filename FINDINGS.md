@@ -633,11 +633,206 @@ bug) and never referenced `mmc0` again. Successful suspends went from
 20-in-23-hours to dozens-per-minute. Confirmed independently via FKM
 after leaving the device idle: deep sleep is now being recorded normally.
 
-**Tradeoff, unresolved**: this is "SD card in vs. real sleep" until the
-SDHCI driver is patched for this hardware. If you need the SD card
-mounted, deep sleep will not work; if you need deep sleep, the card has
-to stay out. No software workaround found or attempted yet - this would
-need an actual kernel driver/device-tree fix (e.g. a suspend/resume quirk
-flag for this card-controller combination, or bypassing the card
-busy-detect check that's causing `mmc_bus_suspend` to bail), which is out
-of scope for a userspace KernelSU module.
+**Tradeoff, at the time**: "SD card in vs. real sleep" until the SDHCI
+driver is patched for this hardware. If you need the SD card mounted,
+deep sleep will not work; if you need deep sleep, the card has to stay
+out. No software workaround found or attempted yet at this point in the
+investigation - see below, this was later solved with a KSU module.
+
+## KernelSU module for the deep-sleep fix: unbind SDHCI on screen-off
+
+User reinserted the physical SD card and asked for an actual KernelSU
+module rather than "remove the card by hand." Since the real bug is a
+kernel PM callback failure (`mmc_bus_suspend` returning -123), not a
+userspace library, the `libmeminfo.so`-style binary patch approach used
+for the reboot-loop fix doesn't apply here - there's no userspace code to
+patch, the failure is inside the kernel's suspend/resume machinery.
+
+### Investigated and ruled out: regulator toggling
+
+First considered forcing off the SD card slot's power regulator
+(`vqmmc`/`vmmc`) as a software-triggered equivalent of physically pulling
+the card. Checked `/sys/class/regulator/` (81 regulators present) for a
+clearly-named SD/MMC supply - found two candidates
+(`pm8150a_s3_mmcx_sup_level`, `pm8150_s3_mmcx_sup_level`) but no
+`regulator_summary` debugfs available to confirm what else those rails
+might power. **Ruled out as too risky** - flipping the wrong shared PMIC
+rail could destabilize unrelated subsystems, and there was no way to
+confirm consumer mapping without kernel source in hand.
+
+### Fix: unbind/rebind the SDHCI platform driver
+
+Settled on a cleaner, standard Linux mechanism: unbinding the SDHCI
+platform driver via sysfs entirely removes the card's device node from
+the kernel's device model, so there's nothing left for system suspend to
+fail on. This is the same interface (`/sys/bus/platform/drivers/<driver>/
+{bind,unbind}`) used for hot-unplugging any platform device cleanly.
+
+Confirmed driver name live: `readlink /sys/devices/platform/soc/
+8804000.sdhci/driver` -> `sdhci_msm`.
+
+**Live-tested manually before writing any module code**, in this order:
+1. `echo 8804000.sdhci > /sys/bus/platform/drivers/sdhci_msm/unbind` -
+   `mmc0` completely disappeared from `/sys/class/mmc_host/`, `dumpsys
+   mount` stopped listing the SD card entirely. `dmesg` showed no errors,
+   normal battery/charging driver chatter only - clean unbind.
+2. Reset `/sys/power/suspend_stats`, watched for 5 minutes with the card
+   physically inserted but the driver unbound: `success` climbed from
+   378 to 420+ with **zero new `mmc0` failures** (`last_failed_dev`
+   shifted to `alarmtimer`, a normal/expected occasional suspend-abort
+   cause unrelated to the SD card).
+3. `echo 8804000.sdhci > /sys/bus/platform/drivers/sdhci_msm/bind` -
+   `mmc0` and the SD card reappeared cleanly in both sysfs and `dumpsys
+   mount`, `dmesg` showed a normal reprobe, no errors.
+
+This confirmed the unbind/rebind approach works exactly as intended
+before committing to building it into a module.
+
+### Module design: `sdcard_suspend_fix`
+
+A `service.sh`-only KernelSU module (no file overlay needed, so
+`mount: false` in `module.prop` is expected/correct) that polls screen
+wakefulness every 2 seconds via `dumpsys power | grep mWakefulness=` and:
+
+- On transition to not-`Awake` (covers `Asleep`, `Dozing`, `Dreaming`),
+  waits 8 seconds (debounce, so a quick screen glance doesn't churn the
+  driver) then unbinds the SDHCI driver.
+- On transition to `Awake`, rebinds immediately (no debounce - user wants
+  the card back as soon as they're looking at the device).
+- Logs every bind/unbind transition (and failures, if any) to
+  `service.log` in the module directory for diagnostics.
+- Handles the "screen already off when the service starts" case
+  correctly via an explicit `unknown` initial state, rather than assuming
+  the screen starts on.
+
+### Verification: full test cycle, including a real reboot
+
+Built, installed via `ksud module install`, then tested two ways:
+
+**1. Manual launch first** (faster iteration, no reboot needed per test):
+launched `service.sh` directly via `nohup ... &` as root over adb. Screen
+happened to already be `Asleep` at launch - confirmed the `unknown` ->
+asleep path works (unbound after the 8s debounce, logged correctly).
+Woke the screen (`input keyevent KEYCODE_WAKEUP`) - rebound immediately,
+card reappeared. Put it back to sleep (`input keyevent KEYCODE_SLEEP`,
+device went to `Dozing`, correctly treated as not-awake) - unbound again
+after debounce, and this time watched `suspend_stats` directly: 45 new
+successful suspends in ~20 seconds with the card unbound, zero new
+failures. Woke again - rebound, card back.
+
+**2. Real reboot, to confirm actual boot-time auto-start** (not just a
+manually-launched process): killed the manual test process, rebooted the
+device for real. After reboot, confirmed via `pgrep` that `service.sh`
+was running under KSU's own `busybox sh` (PID assigned by KSU's service
+launcher, not the earlier manual PID) - i.e. it genuinely auto-started as
+a KSU module service, not something left over from manual testing. The
+service log showed it had already gone through one full unbind/rebind
+cycle during the boot process itself (screen briefly off then on, as
+normal during boot), and the SD card was confirmed present and mounted
+(`dumpsys mount` showing it, `vold` log showing `Check SD Card Slot : 1`)
+in its final settled state.
+
+Both paths (manual launch mid-session, and real auto-start-at-boot)
+confirmed working correctly.
+
+### Caveats, carried into the module's own docs/README
+
+- SD card is unavailable whenever the screen is off - any background
+  process needing SD card access during screen-off (e.g. a sync job)
+  will break. This is an inherent tradeoff of the workaround, not a bug.
+- The 8s debounce is a judgment call, not measured/tuned against real
+  usage patterns yet.
+- Device/driver names (`8804000.sdhci`, `sdhci_msm`) are hardcoded and
+  specific to this hardware - would need updating for a different device.
+
+**Correction to the real-reboot verification above**: the claim that
+"the SD card was confirmed present and mounted" after the real-reboot
+test was checked by presence only (`dumpsys mount` listing the entry at
+all), not by actually reading its `mState=` field. Given what's found
+below, it's very likely it was actually sitting in `unmountable` at that
+point too, not genuinely `mounted` - the presence check alone wasn't
+sufficient to confirm real mount success. Doesn't change the module's
+own correctness (verified independently via kernel-level
+`suspend_stats`, which doesn't depend on vold's mount outcome at all),
+just corrects an overstated claim in the write-up above.
+
+## Separate, pre-existing bug found while testing: SD card fails its own filesystem check
+
+While verifying `sdcard_suspend_fix`, noticed the SD card volume
+(`public:179,1`) never actually settles into `mounted` state after a
+rebind - it sits in `checking` for ~30 seconds, then lands on
+`unmountable`, every single time, including on a completely clean,
+uninterrupted manual unbind/rebind cycle with no screen-state
+interference at all. `dmesg`/`vold` log:
+
+```
+voldUtils Process exited with code: 8
+vold Filesystem check failed (no filesystem)
+vold public:179,1 failed filesystem check
+```
+
+### Ruled out: device lock state
+
+First suspected this was `StorageManagerService` correctly refusing to
+mount external storage while the device was locked (`"Reporting
+public:179,1 unmounted due to system locked"` was genuinely present in
+the log, and `dumpsys trust` confirmed `deviceLocked=1` throughout the
+testing session, since it had only ever been driven over `adb`/root, and
+was never physically unlocked with a real PIN/pattern). **Ruled out**:
+had the user physically unlock the tablet, confirmed `deviceLocked=0` via
+`dumpsys trust`, then ran a fresh clean unbind/rebind cycle - same
+result, `checking` for ~30s then `unmountable`. Device lock state was a
+real, correct thing `StorageManagerService` was reporting, just not the
+actual blocking cause of the mount failure itself.
+
+### Ruled out: fstab misconfiguration
+
+Checked `/vendor/etc/fstab.qcom` for the SD card's vold entry:
+
+```
+# VOLD:samsung/common/fstab.samsung
+/devices/platform/soc/8804000.sdhci/mmc_host*    auto    vfat    defaults    voldmanaged=sdcard:auto
+```
+
+Correctly targets `8804000.sdhci` (the exact same controller node used
+throughout this investigation) with standard `voldmanaged=sdcard:auto`
+declaration - not misconfigured, not pointing at the wrong device.
+
+### Root cause, confirmed directly: boot-block read failure
+
+Ran `fsck_msdos -n` manually against the card's block device
+(`/dev/block/vold/public:179,1`) rather than relying on vold's own
+(less informative) log output:
+
+```
+$ fsck_msdos -n /dev/block/vold/public:179,1
+** /dev/block/vold/public:179,1
+could not read boot block
+(exit code 8, matching vold's logged failure exactly)
+```
+
+This is a genuine I/O-level read failure at the very first sector of the
+filesystem - not a lock, timing, or config issue. Matches the `Card stuck
+in wrong state! card_busy_detect status: 0xf00` / `Send Notification
+about SD Card IO Error` `dmesg` lines seen much earlier in the original
+investigation (before any suspend/lock-state testing), suggesting this
+card has had read-reliability problems with this SDHCI controller/kernel
+combination from the start, independent of the suspend-abort bug -
+likely the same underlying donor-firmware/kernel-driver mismatch theme,
+manifesting a third way (I/O reliability, not a PM callback failure).
+
+### Status: open, not yet fixed, does not block `sdcard_suspend_fix`
+
+Not yet determined whether this is specific to this physical SD card
+(worth testing with a different card to isolate card-vs-slot) or a more
+general SDHCI driver read-path issue on this kernel. Unknown whether the
+card was ever reliably usable as mounted storage on this device before
+today - not something the user could confirm (hadn't used it much).
+
+Does not affect `sdcard_suspend_fix`'s correctness: that module operates
+entirely at the driver-binding level (unbind/rebind via sysfs), before
+vold's mount/fsck attempt is even relevant - confirmed via
+`/sys/power/suspend_stats` counters directly, which don't depend on
+whether vold successfully mounts a filesystem on the card afterward.
+User decided to ship the deep-sleep module now and treat this as a
+separate, still-open investigation for later.
